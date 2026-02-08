@@ -6,6 +6,7 @@ import Link from "next/link";
 import { UploadZone } from "@/components/upload-zone";
 import { CorrectionEditor } from "@/components/correction-editor";
 import { ImageCropper } from "@/components/image-cropper";
+import { ImageClarityChecker } from "@/components/image-clarity-checker";
 import { ParsedQuestion } from "@/lib/ai";
 import { apiClient } from "@/lib/api-client";
 import { AnalyzeResponse, Notebook, AppConfig } from "@/types/api";
@@ -32,6 +33,11 @@ export default function AddErrorPage() {
     // Cropper state
     const [croppingImage, setCroppingImage] = useState<string | null>(null);
     const [isCropperOpen, setIsCropperOpen] = useState(false);
+
+    // Clarity checker state
+    const [isClarityCheckerOpen, setIsClarityCheckerOpen] = useState(false);
+    const [pendingImageBase64, setPendingImageBase64] = useState<string | null>(null);
+    const [suggestedTextFromClarity, setSuggestedTextFromClarity] = useState<string | undefined>(undefined);
 
     // Timeout Config
     const aiTimeout = config?.timeouts?.analyze || 180000;
@@ -102,12 +108,40 @@ export default function AddErrorPage() {
     const handleCropComplete = async (croppedBlob: Blob) => {
         setIsCropperOpen(false);
         const file = new File([croppedBlob], "cropped-image.jpg", { type: "image/jpeg" });
-        handleAnalyze(file);
+        
+        // 压缩图片
+        frontendLogger.info('[AddClarity]', 'Compressing image before clarity check');
+        const base64Image = await processImageFile(file);
+        setPendingImageBase64(base64Image);
+        
+        // 打开清晰度检测对话框
+        setIsClarityCheckerOpen(true);
     };
 
-    const handleAnalyze = async (file: File) => {
+    // 处理清晰度检测后的图片
+    const handleClarityConfirm = (finalImage: string, suggestedText?: string) => {
+        setIsClarityCheckerOpen(false);
+        setCurrentImage(finalImage);
+        setSuggestedTextFromClarity(suggestedText);
+        
+        // 继续 AI 分析流程
+        handleAnalyzeWithImage(finalImage);
+    };
+
+    // 取消清晰度检测
+    const handleClarityCancel = () => {
+        setIsClarityCheckerOpen(false);
+        // 如果取消，也继续分析（使用原图）
+        if (pendingImageBase64) {
+            setCurrentImage(pendingImageBase64);
+            handleAnalyzeWithImage(pendingImageBase64);
+        }
+    };
+
+    // 使用已有图片进行分析（清晰度检测后调用）
+    const handleAnalyzeWithImage = async (base64Image: string) => {
         const startTime = Date.now();
-        frontendLogger.info('[AddAnalyze]', 'Starting analysis flow', {
+        frontendLogger.info('[AddAnalyze]', 'Starting analysis flow with clarity-checked image', {
             timeoutSettings: {
                 apiTimeout: aiTimeout,
                 safetyTimeout
@@ -115,22 +149,14 @@ export default function AddErrorPage() {
         });
 
         try {
-            frontendLogger.info('[AddAnalyze]', 'Step 1/5: Compressing image');
-            setAnalysisStep('compressing');
-            const base64Image = await processImageFile(file);
-            setCurrentImage(base64Image);
-            frontendLogger.info('[AddAnalyze]', 'Image compressed successfully', {
-                size: base64Image.length
-            });
-
-            frontendLogger.info('[AddAnalyze]', 'Step 2/5: Calling API endpoint /api/analyze');
+            frontendLogger.info('[AddAnalyze]', 'Step 1/4: Calling API endpoint /api/analyze');
             setAnalysisStep('analyzing');
             const apiStartTime = Date.now();
             const data = await apiClient.post<AnalyzeResponse>("/api/analyze", {
                 imageBase64: base64Image,
                 language: language,
                 subjectId: notebookId
-            }, { timeout: aiTimeout }); // Use configured timeout
+            }, { timeout: aiTimeout });
             const apiDuration = Date.now() - apiStartTime;
             frontendLogger.info('[AddAnalyze]', 'API response received, validating data', {
                 apiDuration
@@ -145,12 +171,17 @@ export default function AddErrorPage() {
             }
             frontendLogger.info('[AddAnalyze]', 'Response data validated successfully');
 
-            frontendLogger.info('[AddAnalyze]', 'Step 3/5: Setting processing state and progress to 100%');
+            // 如果有清晰度检测提供的建议文字，且 AI 识别的文字为空或不可靠，可以提示用户
+            if (suggestedTextFromClarity && (!data.questionText || data.questionText.length < 10)) {
+                frontendLogger.info('[AddAnalyze]', 'AI recognition might be incomplete, clarity suggestion available');
+            }
+
+            frontendLogger.info('[AddAnalyze]', 'Step 2/4: Setting processing state and progress to 100%');
             setAnalysisStep('processing');
             setProgress(100);
             frontendLogger.info('[AddAnalyze]', 'Progress updated to 100%');
 
-            frontendLogger.info('[AddAnalyze]', 'Step 4/5: Setting parsed data into state');
+            frontendLogger.info('[AddAnalyze]', 'Step 3/4: Setting parsed data into state');
             const dataSize = JSON.stringify(data).length;
             const setDataStart = Date.now();
             setParsedData(data);
@@ -160,7 +191,7 @@ export default function AddErrorPage() {
                 setDataDuration
             });
 
-            frontendLogger.info('[AddAnalyze]', 'Step 5/5: Switching to review page');
+            frontendLogger.info('[AddAnalyze]', 'Step 4/4: Switching to review page');
             const setStepStart = Date.now();
             setStep("review");
             const setStepDuration = Date.now() - setStepStart;
@@ -178,58 +209,34 @@ export default function AddErrorPage() {
                 error: error.message || String(error)
             });
 
-            // 安全的错误处理逻辑，防止在报错时二次报错
+            // 安全的错误处理逻辑
             try {
-                // 解析详细错误信息
                 let errorMessage = t.common.messages?.analysisFailed || 'Analysis failed';
-
-                // ApiError 的结构：error.data.message 包含后端返回的错误类型
                 const backendErrorType = error?.data?.message;
 
                 if (backendErrorType && typeof backendErrorType === 'string') {
-                    // 检查是否是已知的 AI 错误类型
-                    // 使用安全访问
                     if (t.errors && typeof t.errors === 'object' && backendErrorType in t.errors) {
                         const mappedError = (t.errors as any)[backendErrorType];
                         if (typeof mappedError === 'string') {
                             errorMessage = mappedError;
-                            frontendLogger.info('[AddError]', `Matched error type: ${backendErrorType}`, {
-                                errorMessage
-                            });
                         }
                     } else {
-                        // 使用后端返回的具体错误消息
                         errorMessage = backendErrorType;
-                        frontendLogger.info('[AddError]', 'Using backend error message', {
-                            errorMessage
-                        });
                     }
                 } else if (error?.message) {
-                    // Fallback：检查 error.message（用于非 API 错误）
                     if (error.message.includes('fetch') || error.message.includes('network')) {
                         errorMessage = t.errors?.AI_CONNECTION_FAILED || '网络连接失败';
                     } else if (typeof error.data === 'string') {
-                        // 如果 data 是字符串（例如 HTML 错误页），可能包含提示
-                        frontendLogger.info('[AddError]', 'Raw error data', {
-                            errorDataPreview: error.data.substring(0, 100)
-                        });
                         errorMessage += ` (${error.status || 'Error'})`;
                     }
                 }
 
                 alert(errorMessage);
             } catch (innerError) {
-                frontendLogger.error('[AddError]', 'Failed to process error message', {
-                    innerError: String(innerError)
-                });
-                // 确保至少弹出一个提示
                 alert('Analysis failed. Please try again.');
             }
         } finally {
-            // Always reset analysis state, even if setState throws
-            frontendLogger.info('[AddAnalyze]', 'Finally: Resetting analysis state to idle');
             setAnalysisStep('idle');
-            frontendLogger.info('[AddAnalyze]', 'Analysis state reset complete');
         }
     };
 
@@ -319,6 +326,16 @@ export default function AddErrorPage() {
                 onClose={() => setIsCropperOpen(false)}
                 onCropComplete={handleCropComplete}
             />
+
+            {/* 图片清晰度检测对话框 */}
+            {pendingImageBase64 && (
+                <ImageClarityChecker
+                    imageBase64={pendingImageBase64}
+                    open={isClarityCheckerOpen}
+                    onConfirm={handleClarityConfirm}
+                    onCancel={handleClarityCancel}
+                />
+            )}
         </main>
     );
 }
